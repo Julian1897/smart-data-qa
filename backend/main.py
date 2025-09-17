@@ -741,10 +741,66 @@ async def query_data(request: QueryRequest):
                     sql_query = f"SELECT * FROM {session_info['table_name']} LIMIT 20"
         
         # 执行查询
-        result = execute_sql(session_info['db_path'], sql_query)
+        try:
+            result = execute_sql(session_info['db_path'], sql_query)
+            show_sql = True  # 默认显示SQL
+        except Exception as sql_error:
+            print(f"SQL执行失败: {sql_error}")
+            # 如果SQL执行失败，尝试不使用SQL的回答方式
+            result = []
+            show_sql = False
         
-        # 创建完整响应（包含SQL和答案）
-        full_answer = create_full_response(request.question, sql_query, result, session_info, conversation_history)
+        # 如果没有结果且问题可能需要特殊处理，尝试不显示SQL
+        if not result:
+            # 对于无法通过SQL解决的问题，直接使用LLM分析
+            llm = create_llm()
+            if llm:
+                try:
+                    direct_analysis = f"基于问题 '{request.question}' 和数据结构分析，无法通过标准SQL查询解决此问题。"
+                    llm_context = f"""
+用户问题：{request.question}
+数据文件：{session_info['file_name']}
+数据列：{', '.join(session_info['columns'])}
+数据行数：{session_info['row_count']}
+
+请基于用户问题和数据结构，提供专业的分析建议或解释为什么无法回答此问题。
+"""
+                    
+                    from langchain_core.messages import HumanMessage
+                    messages = [HumanMessage(content=llm_context)]
+                    response = llm.invoke(messages)
+                    
+                    answer = response.content if hasattr(response, 'content') else str(response)
+                    
+                    # 保存对话历史
+                    conversations[conversation_id].append((request.question, answer))
+                    if len(conversations[conversation_id]) > 10:
+                        conversations[conversation_id] = conversations[conversation_id][-10:]
+                    
+                    return {
+                        "question": request.question,
+                        "answer": answer,
+                        "success": True,
+                        "conversation_id": conversation_id,
+                        "note": "直接LLM分析（无SQL）"
+                    }
+                except Exception:
+                    pass
+            
+            # 如果都失败了，返回无法回答
+            answer = "抱歉，我无法理解这个问题或找不到相关数据。请尝试重新表述您的问题。"
+            conversations[conversation_id].append((request.question, answer))
+            
+            return {
+                "question": request.question,
+                "answer": answer,
+                "success": True,
+                "conversation_id": conversation_id,
+                "note": "无法生成有效查询"
+            }
+        
+        # 创建完整响应（根据show_sql决定是否包含SQL）
+        full_answer = create_full_response(request.question, sql_query, result, session_info, conversation_history, show_sql)
         
         # 创建基础答案用于上下文分析（不包含SQL，避免污染上下文）
         basic_answer = format_answer(request.question, sql_query, result, session_info['table_name'])
