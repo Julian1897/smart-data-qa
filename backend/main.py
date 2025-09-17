@@ -30,6 +30,7 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     question: str
     session_id: str
+    conversation_id: Optional[str] = None
 
 class DataSourceInfo(BaseModel):
     name: str
@@ -46,6 +47,9 @@ class ModelConfig(BaseModel):
 
 # 存储会话信息
 sessions = {}
+
+# 存储对话历史
+conversations = {}
 
 # LLM配置
 def create_llm(api_key: str = None, api_base: str = None, model_name: str = None):
@@ -155,172 +159,171 @@ def read_excel_with_engine(file_path: str, extension: str) -> pd.DataFrame:
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Excel 解析失败：{str(e)}")
 
-# 地质化学数据专业分析
-def analyze_geological_evolution(question: str, df: pd.DataFrame) -> str:
-    """分析地质化学数据中的演化程度"""
-    try:
-        # 检查是否包含地质化学数据的关键列
-        sio2_cols = [col for col in df.columns if 'SiO2' in str(col) or 'sio2' in str(col).lower()]
-        mgo_cols = [col for col in df.columns if 'MgO' in str(col) or 'mgo' in str(col).lower()]
-        k2o_cols = [col for col in df.columns if 'K2O' in str(col) or 'k2o' in str(col).lower()]
-        sample_id_cols = [col for col in df.columns if 'sample' in str(col).lower() or '样品' in str(col)]
+def extract_answer_from_full_response(full_response: str) -> str:
+    """从SQl+答案的完整响应中提取纯答案部分，用于上下文分析"""
+    # 如果包含SQL查询格式，提取SQL后面的内容
+    if '🔍 **SQL查询**:' in full_response:
+        # 找到SQL代码块结束后的内容
+        parts = full_response.split('```')
+        if len(parts) >= 3:
+            # 返回第二个```后面的内容
+            answer_part = parts[2].strip()
+            # 移除开头的换行
+            return answer_part.lstrip('\n').strip()
+    
+    # 如果没有SQL格式，直接返回原内容
+    return full_response
 
-        if not (sio2_cols and mgo_cols and k2o_cols):
-            return None
+# 处理代词引用的辅助函数
+def has_implicit_context_reference(question: str, conversation_history: list) -> bool:
+    """检查问题中是否包含隐式的上下文引用"""
+    if not conversation_history:
+        return False
+    
+    question_lower = question.lower()
+    
+    # 检查是否有明显的上下文指示词
+    context_indicators = [
+        '哪一年', '什么时候', '在哪里', '怎么', '为什么', '多少',
+        '是哪', '是什么', '是谁', '是怎么', '有多', '有什么'
+    ]
+    
+    # 如果问题以这些词开头，且问题很短，很可能是对上一个答案的追问
+    for indicator in context_indicators:
+        if question_lower.startswith(indicator) and len(question.strip()) < 30:
+            return True
+    
+    # 检查是否是简短的追问（只有几个字，且包含疑问词）
+    question_words = question.strip().split()
+    if len(question_words) <= 8 and any(word in question_lower for word in ['什么', '哪', '怎么', '为什么', '多少', '何时']):
+        return True
+    
+    return False
 
-        sio2_col = sio2_cols[0]
-        mgo_col = mgo_cols[0]
-        k2o_col = k2o_cols[0]
-        sample_id_col = sample_id_cols[0] if sample_id_cols else df.columns[0]
+def has_pronoun_reference(question: str) -> bool:
+    """检查问题中是否包含代词引用"""
+    pronouns = ['他们', '它们', '这个', '这些', '那个', '那些', '他', '她', '它', '其', '此']
+    return any(pronoun in question for pronoun in pronouns)
 
-        # 计算演化指数：SiO2 + K2O - MgO
-        # 这是地质学中常用的岩浆演化程度指标
-        df_copy = df.copy()
-        df_copy['演化指数'] = df_copy[sio2_col] + df_copy[k2o_col] - df_copy[mgo_col]
+def process_pronoun_references(question: str, conversation_history: list) -> str:
+    """处理问题中的代词引用和隐式上下文引用，基于对话历史替换代词"""
+    if not conversation_history:
+        return question
+    
+    # 获取最近的对话
+    if len(conversation_history) > 0:
+        last_question, last_full_answer = conversation_history[-1]
+        # 提取纯答案部分，去除SQL信息
+        last_answer = extract_answer_from_full_response(last_full_answer)
+        
+        # 简单的代词替换策略
+        processed_question = question
+        
+        # 处理明显的代词引用
+        if '他们' in question and '部门' in last_answer:
+            # 尝试从上一个回答中提取部门名称
+            import re
+            dept_match = re.search(r'(\w+)部门', last_answer)
+            if dept_match:
+                dept_name = dept_match.group(1)
+                processed_question = processed_question.replace('他们', f'{dept_name}部门')
+            elif '平均工资最高的部门' in last_answer or '平均薪资最高' in last_answer:
+                # 如果上一个问题是关于平均工资最高的部门
+                processed_question = processed_question.replace('他们', '平均工资最高的部门')
+        
+        # 处理其他代词
+        if '它' in question:
+            # 尝试从上一个回答中提取实体
+            import re
+            entity_patterns = [
+                r'(\w+属)',  # 地质学中的属
+                r'(\w+样品)',  # 样品
+                r'(\w+纪)',   # 地质纪
+                r'(\w+化石)',  # 化石
+            ]
+            for pattern in entity_patterns:
+                match = re.search(pattern, last_answer)
+                if match:
+                    entity = match.group(1)
+                    processed_question = processed_question.replace('它', entity)
+                    break
+        
+        # 处理隐式上下文引用
+        if has_implicit_context_reference(question, conversation_history):
+            # 对于隐式引用，添加上下文信息
+            if '哪一年' in question.lower() or '什么时候' in question.lower():
+                # 如果问的是时间，尝试找到上一个答案中的主要实体
+                import re
+                # 找到化石名称
+                fossil_match = re.search(r'([\w\s]+化石|[\w\s]+fossil)', last_answer, re.IGNORECASE)
+                if fossil_match:
+                    fossil_name = fossil_match.group(1)
+                    processed_question = f"{fossil_name}{processed_question}"
+                # 找到其他实体
+                elif re.search(r'(\w+属|最早的\w+)', last_answer):
+                    entity_match = re.search(r'(最早的\w+|\w+属|\w+样品)', last_answer)
+                    if entity_match:
+                        entity = entity_match.group(1)
+                        processed_question = f"{entity}{processed_question}"
+                        
+            elif '在哪里' in question.lower() or '哪个地方' in question.lower():
+                # 如果问的是地点
+                import re
+                entity_match = re.search(r'(最早的\w+|\w+化石|\w+属)', last_answer)
+                if entity_match:
+                    entity = entity_match.group(1)
+                    processed_question = f"{entity}{processed_question}"
+        
+        # 如果问题包含"这个"或"这些"
+        if '这个' in question or '这些' in question:
+            # 基于上一个问题的主题来推断
+            if '部门' in last_question:
+                processed_question = processed_question.replace('这个', '这个部门').replace('这些', '这些部门')
+            elif '样品' in last_question or '化石' in last_question:
+                processed_question = processed_question.replace('这个', '这个化石').replace('这些', '这些化石')
+    
+    return processed_question
 
-        # 找到演化程度最高的样品
-        max_evolution_idx = df_copy['演化指数'].idxmax()
-        max_sample = df_copy.iloc[max_evolution_idx]
-
-        sample_id = max_sample[sample_id_col]
-        evolution_index = max_sample['演化指数']
-        sio2_val = max_sample[sio2_col]
-        mgo_val = max_sample[mgo_col]
-        k2o_val = max_sample[k2o_col]
-
-        # 检查是否有岩石类型列
-        rock_type_info = ""
-        rock_type_cols = [col for col in df.columns if 'rock' in str(col).lower() or '岩石' in str(col) or 'type' in str(col).lower()]
-        if rock_type_cols:
-            rock_type = max_sample[rock_type_cols[0]]
-            rock_type_info = f"，岩石类型为{rock_type}"
-
-        return f"样品{sample_id}表现出最高的演化程度{rock_type_info}。该样品的演化指数为{evolution_index:.1f}（计算方式：SiO2({sio2_val}%) + K2O({k2o_val}%) - MgO({mgo_val}%) = {evolution_index:.1f}）。在地质学中，高SiO2含量、高K2O含量和低MgO含量通常表示岩浆经历了更高程度的分异演化。"
-
-    except Exception as e:
-        print(f"地质演化分析失败: {e}")
-        return None
-
-# 古生物地质时间专业分析
-def analyze_geological_time(question: str, df: pd.DataFrame) -> str:
-    """分析古生物分类学数据中的地质时间问题"""
-    try:
-        # 检查是否包含地质时间数据的关键列
-        genus_cols = [col for col in df.columns if 'genus' in str(col).lower() or '属' in str(col)]
-        period_cols = [col for col in df.columns if 'period' in str(col).lower() or '纪' in str(col)]
-        epoch_cols = [col for col in df.columns if 'epoch' in str(col).lower() or '世' in str(col)]
-        first_app_cols = [col for col in df.columns if 'first' in str(col).lower() and 'ma' in str(col).lower()]
-        last_app_cols = [col for col in df.columns if 'last' in str(col).lower() and 'ma' in str(col).lower()]
-
-        if not (genus_cols and first_app_cols and last_app_cols):
-            return None
-
-        genus_col = genus_cols[0]
-        first_app_col = first_app_cols[0]
-        last_app_col = last_app_cols[0]
-        period_col = period_cols[0] if period_cols else None
-        epoch_col = epoch_cols[0] if epoch_cols else None
-
-        question_lower = question.lower()
-
-        # 处理地质存续时间最长的属
-        if "存续时间" in question and ("最长" in question or "最大" in question):
-            # 计算每个属的存续时间（Ma值越大表示越早，所以存续时间 = FirstAppearance - LastAppearance）
-            df_copy = df.copy()
-            df_copy['存续时间'] = df_copy[first_app_col] - df_copy[last_app_col]
-
-            # 找到存续时间最长的属
-            max_duration_idx = df_copy['存续时间'].idxmax()
-            max_genus = df_copy.iloc[max_duration_idx]
-
-            genus_name = max_genus[genus_col]
-            duration = max_genus['存续时间']
-            first_app = max_genus[first_app_col]
-            last_app = max_genus[last_app_col]
-
-            period_info = ""
-            if period_col:
-                period_info = f"，主要存在于{max_genus[period_col]}纪"
-
-            return f"{genus_name}属的地质存续时间最长{period_info}。该属从{first_app:.1f}百万年前首次出现，直到{last_app:.1f}百万年前最后消失，总存续时间为{duration:.1f}百万年。"
-
-        # 处理奥陶纪时期筛选问题
-        if "奥陶纪" in question or "ordovician" in question_lower:
-            df_copy = df.copy()
-
-            # 奥陶纪时间范围：485.4-443.8 Ma
-            # 早奥陶世：485.4-470 Ma
-            # 中奥陶世：470-458.4 Ma
-            # 晚奥陶世：458.4-445.2 Ma
-
-            if "晚奥陶世" in question or "late ordovician" in question_lower:
-                # 筛选在奥陶纪出现，但在晚奥陶世之前就绝迹的属
-                # 在奥陶纪出现：FirstAppearance <= 485.4
-                # 在晚奥陶世前绝迹：LastAppearance > 458.4
-                ordovician_genera = df_copy[
-                    (df_copy[first_app_col] <= 485.4) &  # 在奥陶纪或之前出现
-                    (df_copy[last_app_col] > 458.4) &    # 在晚奥陶世开始之前就绝迹
-                    (df_copy[first_app_col] > df_copy[last_app_col])  # 确保时间逻辑正确
-                ]
-            else:
-                # 筛选奥陶纪的属（FirstAppearance在奥陶纪范围内或更早，LastAppearance在奥陶纪范围内或更晚）
-                ordovician_genera = df_copy[
-                    (df_copy[first_app_col] <= 485.4) &  # 在奥陶纪结束前出现
-                    (df_copy[last_app_col] >= 443.8)     # 在奥陶纪开始后消失
-                ]
-
-            if len(ordovician_genera) == 0:
-                return "在指定条件下，没有找到符合要求的属。"
-
-            # 构建回答
-            genera_names = ordovician_genera[genus_col].tolist()
-            if len(genera_names) == 1:
-                genus_info = ordovician_genera.iloc[0]
-                first_app = genus_info[first_app_col]
-                last_app = genus_info[last_app_col]
-                return f"符合条件的属是：{genera_names[0]}。该属在{first_app:.1f}百万年前首次出现，在{last_app:.1f}百万年前消失。"
-            else:
-                return f"符合条件的属有：{', '.join(genera_names)}。"
-
-        return None
-
-    except Exception as e:
-        print(f"地质时间分析失败: {e}")
-        return None
+def generate_contextual_query(processed_question: str, conversation_history: list, session_info: dict) -> str:
+    """基于上下文生成SQL查询"""
+    if not conversation_history:
+        return f"SELECT * FROM {session_info['table_name']} LIMIT 10"
+    
+    last_question, last_answer = conversation_history[-1]
+    
+    # 如果当前问题是关于"他们的平均工资"并且上一个问题是关于"平均工资最高的部门"
+    if '平均工资' in processed_question and '平均工资最高' in last_answer:
+        # 生成查询最高平均工资部门的具体工资数值
+        return f"SELECT department, AVG(salary) as avg_salary FROM {session_info['table_name']} GROUP BY department ORDER BY avg_salary DESC LIMIT 1"
+    
+    # 默认查询
+    return f"SELECT * FROM {session_info['table_name']} LIMIT 10"
 
 # 智能分析查询结果
-def analyze_with_llm(question: str, sql_query: str, result: list, llm, session_info: dict = None) -> str:
+def analyze_with_llm(question: str, sql_query: str, result: list, llm, session_info: dict = None, conversation_history: list = None) -> str:
     """使用LLM分析SQL查询结果，提供智能解释"""
     if not result:
         return "我不知道"
-
-    # 特殊处理地质相关问题
-    if session_info and session_info.get('db_path'):
-        try:
-            # 从数据库读取完整数据进行地质分析
-            conn = sqlite3.connect(session_info['db_path'])
-            df = pd.read_sql_query(f"SELECT * FROM {session_info['table_name']}", conn)
-            conn.close()
-
-            # 处理地质演化程度问题
-            if "演化程度" in question or "演化" in question:
-                geological_analysis = analyze_geological_evolution(question, df)
-                if geological_analysis:
-                    return geological_analysis
-
-            # 处理地质时间相关问题
-            if any(keyword in question.lower() for keyword in ['存续时间', '奥陶纪', 'ordovician', 'ma', '百万年', '地质时间', '属']):
-                geological_time_analysis = analyze_geological_time(question, df)
-                if geological_time_analysis:
-                    return geological_time_analysis
-
-        except Exception as e:
-            print(f"地质数据分析失败: {e}")
 
     if not llm:
         return "我不知道"
 
     try:
+        # 构建对话上下文
+        context_info = ""
+        if conversation_history:
+            context_info = "\n\n对话历史：\n"
+            for i, (prev_q, prev_full_a) in enumerate(conversation_history[-3:]):
+                # 提取纯答案部分，去除SQL信息
+                prev_a = extract_answer_from_full_response(prev_full_a)
+                context_info += f"{i+1}. 问题：{prev_q}\n   回答：{prev_a}\n"
+            
+            # 检查是否是上下文相关问题
+            if has_implicit_context_reference(question, conversation_history) or has_pronoun_reference(question):
+                context_info += "\n重要提示：当前问题似乎与上一个问题的答案相关。请仔细分析对话历史，理解当前问题所指的具体对象或实体。\n"
+            
+            context_info += "\n请根据对话历史理解当前问题中的代词和上下文引用。\n"
+
         # 准备分析提示
         context = f"""
 用户问题：{question}
@@ -329,18 +332,18 @@ def analyze_with_llm(question: str, sql_query: str, result: list, llm, session_i
 {sql_query}
 
 查询结果：
-{result}
+{result}{context_info}
 
-请基于查询结果回答用户的问题。特别注意：
-1. 如果涉及时间/年代比较，请提供专业的时间顺序分析
-2. 如果涉及地质年代（如Silurian, Carboniferous等），请说明它们的时间关系
-3. 如果涉及地质演化程度，请考虑SiO2、MgO、K2O等化学成分的意义
-4. 如果是数值比较，请明确指出最大/最小值
-5. 如果是统计分析，请提供清晰的总结
-6. 请用中文回答，语言简洁专业
-7. 如果无法得出明确结论，请直接回答"我不知道"
-
-请直接回答用户的问题，不要重复查询结果的原始数据。
+请分析查询结果并回答用户的问题。要求：
+1. 直接回答用户的问题，不要重复查询结果的原始数据
+2. 如果用户使用了代词（如"他们"、"它"、"这个"等），请结合对话历史来理解指代内容
+3. 如果涉及时间/年代比较，请提供专业的时间顺序分析
+4. 如果涉及地质年代（如Silurian, Carboniferous等），请说明它们的时间关系
+5. 如果涉及地质演化程度，请考虑SiO2、MgO、K2O等化学成分的意义
+6. 如果是数值比较，请明确指出最大/最小值
+7. 如果是统计分析，请提供清晰的总结
+8. 请用中文回答，语言简洁专业
+9. 如果无法得出明确结论，请直接回答"我不知道"
 """
 
         # 调用LLM分析
@@ -356,16 +359,13 @@ def analyze_with_llm(question: str, sql_query: str, result: list, llm, session_i
     except Exception as e:
         print(f"LLM分析失败: {e}")
         return "我不知道"
+
 def format_answer(question: str, sql_query: str, result: list, table_name: str) -> str:
     """将SQL查询结果转换为自然语言回答"""
     if not result:
         return "我不知道"
 
     question_lower = question.lower()
-
-    # 特殊处理演化程度问题 - 如果SQL查询无法直接解决，返回"我不知道"
-    if "演化程度" in question or "演化" in question:
-        return "我不知道"
 
     # 处理计数类问题
     if "多少" in question_lower or "数量" in question_lower or "count" in question_lower:
@@ -491,6 +491,30 @@ def format_answer(question: str, sql_query: str, result: list, table_name: str) 
         formatted_result += f"... 还有{len(result) - 5}条记录"
         return formatted_result
 
+def create_full_response(question: str, sql_query: str, result: list, session_info: dict, conversation_history: list) -> str:
+    """创建包含SQL查询和答案的完整响应"""
+    # 清理SQL查询，去除多余的空格和换行
+    clean_sql = ' '.join(sql_query.split())
+    
+    print(f"[DEBUG] 正在创建包含SQL的响应: {clean_sql[:50]}...")  # 调试信息
+    
+    # 创建LLM实例进行智能分析
+    llm = create_llm()
+    
+    if llm:
+        # 尝试LLM智能分析
+        llm_analysis = analyze_with_llm(question, sql_query, result, llm, session_info, conversation_history)
+        if llm_analysis and llm_analysis != "我不知道":
+            final_response = f"🔍 **SQL查询**: ```sql\n{clean_sql}\n```\n\n{llm_analysis}"
+            print(f"[DEBUG] LLM分析成功，返回包含SQL的响应")  # 调试信息
+            return final_response
+    
+    # 如果LLM分析失败，使用基础格式化
+    basic_answer = format_answer(question, sql_query, result, session_info['table_name'])
+    final_response = f"🔍 **SQL查询**: ```sql\n{clean_sql}\n```\n\n{basic_answer}"
+    print(f"[DEBUG] 使用基础格式化，返回包含SQL的响应")  # 调试信息
+    return final_response
+
 # 本地执行 SQL（不依赖 LangChain）
 def execute_sql(db_path: str, sql_query: str):
     try:
@@ -578,13 +602,15 @@ async def upload_file(file: UploadFile = File(...)):
         conn.close()
         
         # 存储会话信息
+        import time
         sessions[session_id] = {
             "db_path": db_path,
             "table_name": table_name,
             "file_name": file.filename,
             "columns": df.columns.tolist(),
             "row_count": len(df),
-            "temp_dir": temp_dir
+            "temp_dir": temp_dir,
+            "created_at": time.time()
         }
         
         # 为前端返回的示例数据也需要清理NaN值
@@ -612,11 +638,67 @@ async def query_data(request: QueryRequest):
         
         session_info = sessions[request.session_id]
         
+        # 获取或创建对话历史
+        conversation_id = request.conversation_id or f"conv_{request.session_id}_default"
+        if conversation_id not in conversations:
+            conversations[conversation_id] = []
+        
+        conversation_history = conversations[conversation_id]
+        
+        # 处理代词引用问题
+        processed_question = process_pronoun_references(request.question, conversation_history)
+        
         # 创建LLM实例
         llm = create_llm()
         
-        if llm is None:
-            # 如果LLM创建失败，尝试基础查询 + 智能分析模式
+        # 生成SQL查询
+        sql_query = None
+        
+        if llm:
+            try:
+                # 使用LangChain创建SQL查询链（延迟导入）
+                from langchain_community.utilities import SQLDatabase
+                from langchain.chains import create_sql_query_chain
+
+                # 创建数据库连接（供 LangChain 读取库结构）
+                db = SQLDatabase.from_uri(f"sqlite:///{session_info['db_path']}")
+                chain = create_sql_query_chain(llm, db)
+                
+                # 生成SQL查询（使用处理后的问题）
+                sql_query = chain.invoke({"question": processed_question})
+                
+                # 清理SQL查询字符串
+                if isinstance(sql_query, str):
+                    # 移除可能的markdown格式
+                    sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+                    # 提取SQL语句：找到SELECT开始到分号结束的部分
+                    lines = sql_query.split('\n')
+                    sql_lines = []
+                    in_sql = False
+                    for line in lines:
+                        line = line.strip()
+                        if line.upper().startswith(('SELECT', 'WITH')):
+                            in_sql = True
+                            sql_lines.append(line)
+                        elif in_sql:
+                            if line.endswith(';'):
+                                sql_lines.append(line)
+                                break
+                            elif line and not line.startswith('--'):  # 忽略注释行
+                                sql_lines.append(line)
+
+                    if sql_lines:
+                        sql_query = ' '.join(sql_lines)
+                    else:
+                        # 如果没有找到SQL，使用基础查询
+                        sql_query = f"SELECT * FROM {session_info['table_name']} LIMIT 10"
+                        
+            except Exception as llm_error:
+                print(f"LLM查询生成失败: {llm_error}")
+                sql_query = None
+        
+        # 如果LLM生成SQL失败，使用基础查询逻辑
+        if not sql_query:
             question_lower = request.question.lower()
             
             # 改进的基础查询逻辑
@@ -631,20 +713,7 @@ async def query_data(request: QueryRequest):
                 else:
                     sql_query = f"SELECT AVG(salary) as avg_salary FROM {session_info['table_name']}"
             elif "化石" in question_lower or "年代" in question_lower or "时间" in question_lower:
-                # 对于涉及时间比较的查询，获取相关数据让LLM分析
-                sql_query = f"SELECT * FROM {session_info['table_name']} WHERE 1=1"
-                # 尝试找到包含时间、年代、化石等关键词的列
-                time_related_columns = []
-                for col in session_info['columns']:
-                    col_lower = str(col).lower()
-                    if any(keyword in col_lower for keyword in ['time', 'age', 'period', 'epoch', 'era', '时间', '年代', '时期']):
-                        time_related_columns.append(col)
-                
-                if time_related_columns:
-                    columns_str = ', '.join(time_related_columns + ['*'])
-                    sql_query = f"SELECT {columns_str} FROM {session_info['table_name']}"
-                else:
-                    sql_query = f"SELECT * FROM {session_info['table_name']}"
+                sql_query = f"SELECT * FROM {session_info['table_name']}"
             elif "最高" in question_lower and ("工资" in question_lower or "薪资" in question_lower):
                 if "部门" in question_lower:
                     sql_query = f"SELECT department, MAX(salary) as max_salary FROM {session_info['table_name']} GROUP BY department ORDER BY max_salary DESC LIMIT 1"
@@ -665,145 +734,33 @@ async def query_data(request: QueryRequest):
             elif "所有" in question_lower or "全部" in question_lower:
                 sql_query = f"SELECT * FROM {session_info['table_name']}"
             else:
-                # 默认查询：对于其他问题，尝试获取所有数据让LLM分析
-                sql_query = f"SELECT * FROM {session_info['table_name']} LIMIT 20"
-            
-            result = execute_sql(session_info['db_path'], sql_query)
-            
-            # 尝试使用LLM分析结果（即使主LLM失败，也尝试创建一个新的）
-            try:
-                analysis_llm = create_llm()
-                if analysis_llm:
-                    llm_analysis = analyze_with_llm(request.question, sql_query, result, analysis_llm, session_info)
-                    if llm_analysis:
-                        return {
-                            "question": request.question,
-                            "answer": llm_analysis,
-                            "success": True,
-                            "note": "使用LLM智能分析模式"
-                        }
-            except Exception as analysis_error:
-                print(f"LLM分析失败: {analysis_error}")
-            
-            # 如果LLM分析也失败，回退到基础格式化
-            answer = format_answer(request.question, sql_query, result, session_info['table_name'])
-            
-            return {
-                "question": request.question,
-                "answer": answer,
-                "success": True,
-                "note": "使用基础查询模式"
-            }
+                # 对于代词引用或隐式上下文引用，尝试基于上下文生成查询
+                if (has_pronoun_reference(request.question) or has_implicit_context_reference(request.question, conversation_history)) and conversation_history:
+                    sql_query = generate_contextual_query(processed_question, conversation_history, session_info)
+                else:
+                    sql_query = f"SELECT * FROM {session_info['table_name']} LIMIT 20"
         
-        try:
-            # 使用LangChain创建SQL查询链（延迟导入）
-            from langchain_community.utilities import SQLDatabase  # 正确导入路径
-            from langchain.chains import create_sql_query_chain  # 延迟导入
-
-            # 创建数据库连接（供 LangChain 读取库结构）
-            db = SQLDatabase.from_uri(f"sqlite:///{session_info['db_path']}")
-            chain = create_sql_query_chain(llm, db)
-            
-            # 生成SQL查询
-            sql_query = chain.invoke({"question": request.question})
-            
-            # 清理SQL查询字符串
-            if isinstance(sql_query, str):
-                # 移除可能的markdown格式
-                sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
-                # 提取SQL语句：找到SELECT开始到分号结束的部分
-                lines = sql_query.split('\n')
-                sql_lines = []
-                in_sql = False
-                for line in lines:
-                    line = line.strip()
-                    if line.upper().startswith(('SELECT', 'WITH')):
-                        in_sql = True
-                        sql_lines.append(line)
-                    elif in_sql:
-                        if line.endswith(';'):
-                            sql_lines.append(line)
-                            break
-                        elif line and not line.startswith('--'):  # 忽略注释行
-                            sql_lines.append(line)
-
-                if sql_lines:
-                    sql_query = ' '.join(sql_lines)
-                else:
-                    # 如果没有找到SQL，使用基础查询
-                    sql_query = f"SELECT * FROM {session_info['table_name']} LIMIT 10"
-            
-            # 执行查询
-            result = execute_sql(session_info['db_path'], sql_query)
-            
-            # 首先尝试LLM智能分析
-            llm_analysis = analyze_with_llm(request.question, sql_query, result, llm, session_info)
-            if llm_analysis:
-                return {
-                    "question": request.question,
-                    "answer": llm_analysis,
-                    "success": True,
-                    "note": "使用LLM智能分析"
-                }
-            
-            # 如果LLM分析失败，回退到格式化答案
-            answer = format_answer(request.question, sql_query, result, session_info['table_name'])
-            
-            return {
-                "question": request.question,
-                "answer": answer,
-                "success": True
-            }
-            
-        except Exception as llm_error:
-            print(f"LLM查询失败: {llm_error}")
-            # 如果LLM查询失败，尝试一些基本的查询模式
-            question_lower = request.question.lower()
-            
-            # 改进的基础查询逻辑
-            if "平均" in question_lower and ("工资" in question_lower or "薪资" in question_lower):
-                if "部门" in question_lower:
-                    # 各部门平均工资查询
-                    if "最高" in question_lower or "最大" in question_lower:
-                        sql_query = f"SELECT department, AVG(salary) as avg_salary FROM {session_info['table_name']} GROUP BY department ORDER BY avg_salary DESC LIMIT 1"
-                    elif "最低" in question_lower or "最小" in question_lower:
-                        sql_query = f"SELECT department, AVG(salary) as avg_salary FROM {session_info['table_name']} GROUP BY department ORDER BY avg_salary ASC LIMIT 1"
-                    else:
-                        sql_query = f"SELECT department, AVG(salary) as avg_salary FROM {session_info['table_name']} GROUP BY department ORDER BY avg_salary DESC"
-                else:
-                    sql_query = f"SELECT AVG(salary) as avg_salary FROM {session_info['table_name']}"
-            elif "最高" in question_lower and ("工资" in question_lower or "薪资" in question_lower):
-                if "部门" in question_lower:
-                    sql_query = f"SELECT department, MAX(salary) as max_salary FROM {session_info['table_name']} GROUP BY department ORDER BY max_salary DESC LIMIT 1"
-                else:
-                    sql_query = f"SELECT * FROM {session_info['table_name']} ORDER BY salary DESC LIMIT 1"
-            elif "多少行" in question_lower or "行数" in question_lower or "count" in question_lower:
-                if "部门" in question_lower:
-                    sql_query = f"SELECT department, COUNT(*) as count FROM {session_info['table_name']} GROUP BY department"
-                else:
-                    sql_query = f"SELECT COUNT(*) as total_rows FROM {session_info['table_name']}"
-            elif "前" in question_lower and ("条" in question_lower or "行" in question_lower):
-                # 提取数字
-                import re
-                numbers = re.findall(r'\d+', request.question)
-                limit = numbers[0] if numbers else "10"
-                sql_query = f"SELECT * FROM {session_info['table_name']} LIMIT {limit}"
-            elif "各" in question_lower and "部门" in question_lower:
-                sql_query = f"SELECT department, COUNT(*) as count, AVG(salary) as avg_salary FROM {session_info['table_name']} GROUP BY department"
-            elif "所有" in question_lower or "全部" in question_lower:
-                sql_query = f"SELECT * FROM {session_info['table_name']}"
-            else:
-                sql_query = f"SELECT * FROM {session_info['table_name']} LIMIT 5"
-            
-            result = execute_sql(session_info['db_path'], sql_query)
-            answer = format_answer(request.question, sql_query, result, session_info['table_name'])
-            
-            return {
-                "question": request.question,
-                "answer": answer,
-                "success": True,
-                "note": "使用基础查询模式"
-            }
+        # 执行查询
+        result = execute_sql(session_info['db_path'], sql_query)
+        
+        # 创建完整响应（包含SQL和答案）
+        full_answer = create_full_response(request.question, sql_query, result, session_info, conversation_history)
+        
+        # 创建基础答案用于上下文分析（不包含SQL，避免污染上下文）
+        basic_answer = format_answer(request.question, sql_query, result, session_info['table_name'])
+        
+        # 保存对话历史（保存完整答案用于显示，但在上下文分析时会被过滤）
+        conversations[conversation_id].append((request.question, full_answer))
+        if len(conversations[conversation_id]) > 10:
+            conversations[conversation_id] = conversations[conversation_id][-10:]
+        
+        return {
+            "question": request.question,
+            "answer": full_answer,
+            "success": True,
+            "conversation_id": conversation_id,
+            "note": "SQL查询已显示"
+        }
         
     except Exception as e:
         return {
@@ -811,6 +768,113 @@ async def query_data(request: QueryRequest):
             "answer": f"查询出错：{str(e)}",
             "success": False
         }
+
+@app.get("/sessions")
+async def list_all_sessions():
+    """获取所有会话列表"""
+    session_list = []
+    for session_id, session_info in sessions.items():
+        # 获取该会话的对话数量
+        conversation_count = len([conv_id for conv_id in conversations.keys() if conv_id.startswith(f"conv_{session_id}_")])
+        
+        session_list.append({
+            "session_id": session_id,
+            "file_name": session_info["file_name"],
+            "row_count": session_info["row_count"],
+            "columns_count": len(session_info["columns"]),
+            "conversation_count": conversation_count,
+            "created_at": session_info.get("created_at", "Unknown")
+        })
+    
+    # 按创建时间排序（最新的在前）
+    session_list.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+    
+    return {
+        "sessions": session_list
+    }
+
+@app.get("/sessions/{session_id}/conversations")
+async def list_conversations(session_id: str):
+    """获取会话的所有对话列表"""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    
+    # 查找所有属于该session的对话
+    session_conversations = []
+    for conv_id, history in conversations.items():
+        if conv_id.startswith(f"conv_{session_id}_"):
+            # 计算对话信息
+            message_count = len(history)
+            last_activity = None
+            conversation_title = "新对话"
+            
+            if history:
+                # 使用第一个问题作为标题（截取前30个字符）
+                first_question = history[0][0]
+                conversation_title = first_question[:30] + ("..." if len(first_question) > 30 else "")
+                # 最后一次活动时间（模拟，实际应该用时间戳）
+                import datetime
+                last_activity = datetime.datetime.now().isoformat()
+            
+            session_conversations.append({
+                "conversation_id": conv_id,
+                "title": conversation_title,
+                "message_count": message_count,
+                "last_activity": last_activity
+            })
+    
+    # 按最后活动时间排序（最新的在前）
+    session_conversations.sort(key=lambda x: x['last_activity'] or '', reverse=True)
+    
+    return {
+        "session_id": session_id,
+        "conversations": session_conversations
+    }
+
+@app.post("/sessions/{session_id}/conversations")
+async def create_new_conversation(session_id: str):
+    """为指定会话创建新的对话"""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    
+    # 生成新的对话 ID
+    import time
+    new_conversation_id = f"conv_{session_id}_{int(time.time() * 1000)}"
+    
+    # 初始化空的对话历史
+    conversations[new_conversation_id] = []
+    
+    return {
+        "conversation_id": new_conversation_id,
+        "title": "新对话",
+        "message_count": 0,
+        "created_at": time.time()
+    }
+
+@app.get("/sessions/{session_id}/conversations/{conversation_id}")
+async def get_conversation_history(session_id: str, conversation_id: str):
+    """获取对话历史"""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    
+    if conversation_id not in conversations:
+        return {"conversation_id": conversation_id, "history": []}
+    
+    return {
+        "conversation_id": conversation_id,
+        "history": conversations[conversation_id]
+    }
+
+@app.delete("/sessions/{session_id}/conversations/{conversation_id}")
+async def clear_conversation_history(session_id: str, conversation_id: str):
+    """清空对话历史"""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    
+    if conversation_id in conversations:
+        conversations[conversation_id] = []
+    
+    return {"message": "对话历史已清空"}
 
 @app.get("/sessions/{session_id}/info")
 async def get_session_info(session_id: str):
