@@ -200,10 +200,166 @@ def has_implicit_context_reference(question: str, conversation_history: list) ->
     
     return False
 
+def is_sql_suitable_question(question: str, session_info: dict) -> bool:
+    """判断问题是否适合用SQL查询回答"""
+    question_lower = question.lower()
+
+    # 明确适合SQL的问题类型
+    sql_indicators = [
+        # 数据查询相关
+        '查询', '查找', '找到', '显示', '列出', '展示',
+        # 统计相关
+        '多少', '数量', '总数', '计数', '统计', 'count',
+        # 比较和排序
+        '最大', '最小', '最高', '最低', '排序', '排名',
+        # 平均值和聚合
+        '平均', '总和', '求和', '合计', 'avg', 'sum',
+        # 筛选
+        '筛选', '过滤', '条件', '满足',
+        # 分组
+        '各', '每个', '分组', 'group',
+        # 前N条
+        '前', '后', '第一', '最后',
+        # 具体数据查看
+        '所有', '全部', '全部数据',
+        # 时间相关查询
+        '哪一年', '什么时候', '发现年份', '时间', '年代', '哪年'
+    ]
+
+    # 不适合SQL的问题类型（需要推理、解释、定义等）
+    non_sql_indicators = [
+        # 定义和概念
+        '是什么', '什么是', '定义', '概念', '含义', '意思',
+        # 解释和原因
+        '为什么', '原因', '如何', '解释', '说明',
+        # 建议和推荐
+        '建议', '推荐', '应该', '最好', '怎样',
+        # 比较概念（非数据比较）
+        '区别', '不同', '相似', '比较',
+        # 分析和评估
+        '分析', '评估', '判断', '认为',
+        # 预测和假设
+        '预测', '可能', '会不会', '如果',
+        # 操作指导
+        '怎么做', '如何操作', '步骤', '方法'
+    ]
+
+    # 检查是否包含明确的SQL指示词
+    has_sql_indicator = any(indicator in question_lower for indicator in sql_indicators)
+
+    # 检查是否包含非SQL指示词
+    has_non_sql_indicator = any(indicator in question_lower for indicator in non_sql_indicators)
+
+    # 检查问题是否涉及数据列
+    columns = [col.lower() for col in session_info.get('columns', [])]
+    mentions_columns = any(col in question_lower for col in columns)
+
+    # 特殊处理：时间查询类问题（即使包含"是"也应该显示SQL）
+    time_query_patterns = ['哪一年', '什么时候', '发现年份', '是哪年', '是什么时候']
+    is_time_query = any(pattern in question_lower for pattern in time_query_patterns)
+
+    # 特殊处理：代词引用的数据查询
+    pronoun_data_patterns = ['它是', '他是', '她是', '这是', '那是']
+    has_pronoun_data_query = any(pattern in question_lower for pattern in pronoun_data_patterns)
+
+    # 如果是时间查询或代词数据查询，优先认为适合SQL
+    if is_time_query or (has_pronoun_data_query and any(word in question_lower for word in ['年', '时间', '地点', '数量', '大小'])):
+        return True
+
+    # 判断逻辑
+    if has_non_sql_indicator and not has_sql_indicator and not is_time_query:
+        return False  # 明确不适合SQL的问题
+
+    if has_sql_indicator or mentions_columns:
+        return True  # 明确适合SQL或涉及数据列
+
+    # 对于简短的问题，如果包含数字或时间相关词汇，可能适合SQL
+    if len(question_lower.split()) <= 5:
+        if any(word in question_lower for word in ['时间', '年', '月', '日', '数据']):
+            return True
+
+    # 默认情况：如果不确定，倾向于尝试SQL
+    return True
+
 def has_pronoun_reference(question: str) -> bool:
     """检查问题中是否包含代词引用"""
     pronouns = ['他们', '它们', '这个', '这些', '那个', '那些', '他', '她', '它', '其', '此']
     return any(pronoun in question for pronoun in pronouns)
+
+def extract_main_entity_from_answer(answer: str) -> str:
+    """从答案中智能提取主要实体（化石名称等）"""
+    import re
+
+    # 定义化石名称模式
+    fossil_patterns = [
+        r'\b([A-Z][a-z]+\s+[A-Z])\b',  # 如 Bryozoan F
+        r'\b([A-Z][a-z]+\s+[A-Z][a-z]*)\b',  # 如 Trilobite Adult
+        r'([A-Z][a-z]*\s*[A-Z]\d*)',  # 如 Sample A1
+    ]
+
+    # 收集所有匹配的化石名称及其位置和权重
+    candidates = []
+
+    for pattern in fossil_patterns:
+        matches = list(re.finditer(pattern, answer))
+        for match in matches:
+            fossil_name = match.group(1)
+            start_pos = match.start()
+
+            # 计算权重
+            weight = 0
+
+            # 1. 位置权重：越靠前权重越高（但答案开头更重要）
+            if start_pos < len(answer) * 0.3:  # 前30%
+                weight += 3
+            elif start_pos > len(answer) * 0.7:  # 后30%
+                weight += 2
+            else:
+                weight += 1
+
+            # 2. 语义权重：检查周围的关键词
+            context_before = answer[max(0, start_pos-50):start_pos].lower()
+            context_after = answer[start_pos:start_pos+50].lower()
+            context = context_before + " " + context_after
+
+            # 结论性词汇权重
+            conclusion_words = ['答案', '是', '为', '结果', '因此', '所以', '最', '发现年份最早', '最早的']
+            for word in conclusion_words:
+                if word in context:
+                    weight += 5
+                    break
+
+            # 否定词汇减权
+            negative_words = ['不是', '而不是', '除了', '但是', '然而', '相比之下']
+            for word in negative_words:
+                if word in context_before:
+                    weight -= 3
+                    break
+
+            # 3. 频率权重：在答案中出现次数
+            frequency = len(re.findall(re.escape(fossil_name), answer))
+            weight += frequency * 2
+
+            # 4. 句子结构权重：检查是否在句子的主要位置
+            sentences = answer.split('。')
+            for sentence in sentences:
+                if fossil_name in sentence:
+                    # 如果在句子开头，权重增加
+                    if sentence.strip().startswith(fossil_name):
+                        weight += 3
+                    # 如果跟在"是"、"为"等词后面
+                    if re.search(rf'是\s*{re.escape(fossil_name)}|为\s*{re.escape(fossil_name)}', sentence):
+                        weight += 4
+                    break
+
+            candidates.append((fossil_name, weight, start_pos))
+
+    if not candidates:
+        return ""
+
+    # 按权重排序，取权重最高的
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[0][0]
 
 def process_pronoun_references(question: str, conversation_history: list) -> str:
     """处理问题中的代词引用和隐式上下文引用，基于对话历史替换代词"""
@@ -233,46 +389,64 @@ def process_pronoun_references(question: str, conversation_history: list) -> str
         
         # 处理其他代词
         if '它' in question:
-            # 尝试从上一个回答中提取实体
-            import re
-            entity_patterns = [
-                r'(\w+属)',  # 地质学中的属
-                r'(\w+样品)',  # 样品
-                r'(\w+纪)',   # 地质纪
-                r'(\w+化石)',  # 化石
-            ]
-            for pattern in entity_patterns:
-                match = re.search(pattern, last_answer)
-                if match:
-                    entity = match.group(1)
-                    processed_question = processed_question.replace('它', entity)
-                    break
+            # 使用智能实体提取函数找到主要化石名称
+            main_entity = extract_main_entity_from_answer(last_answer)
+
+            if main_entity:
+                processed_question = processed_question.replace('它', main_entity)
+            else:
+                # 如果没有找到专有名词格式的化石，再尝试通用实体
+                import re
+                entity_patterns = [
+                    r'(\w+属)',  # 地质学中的属
+                    r'(\w+样品)',  # 样品
+                    r'(\w+纪)',   # 地质纪
+                    r'(\w+化石)',  # 化石
+                ]
+                for pattern in entity_patterns:
+                    match = re.search(pattern, last_answer)
+                    if match:
+                        entity = match.group(1)
+                        processed_question = processed_question.replace('它', entity)
+                        break
         
         # 处理隐式上下文引用
         if has_implicit_context_reference(question, conversation_history):
             # 对于隐式引用，添加上下文信息
             if '哪一年' in question.lower() or '什么时候' in question.lower():
                 # 如果问的是时间，尝试找到上一个答案中的主要实体
-                import re
-                # 找到化石名称
-                fossil_match = re.search(r'([\w\s]+化石|[\w\s]+fossil)', last_answer, re.IGNORECASE)
-                if fossil_match:
-                    fossil_name = fossil_match.group(1)
-                    processed_question = f"{fossil_name}{processed_question}"
-                # 找到其他实体
-                elif re.search(r'(\w+属|最早的\w+)', last_answer):
-                    entity_match = re.search(r'(最早的\w+|\w+属|\w+样品)', last_answer)
-                    if entity_match:
-                        entity = entity_match.group(1)
-                        processed_question = f"{entity}{processed_question}"
+                main_entity = extract_main_entity_from_answer(last_answer)
+
+                if main_entity:
+                    processed_question = f"{main_entity}{processed_question}"
+                else:
+                    # 如果没找到专有名词格式，再尝试通用格式
+                    import re
+                    # 找到化石名称
+                    fossil_match = re.search(r'([\w\s]+化石|[\w\s]+fossil)', last_answer, re.IGNORECASE)
+                    if fossil_match:
+                        fossil_name = fossil_match.group(1)
+                        processed_question = f"{fossil_name}{processed_question}"
+                    # 找到其他实体
+                    elif re.search(r'(\w+属|最早的\w+)', last_answer):
+                        entity_match = re.search(r'(最早的\w+|\w+属|\w+样品)', last_answer)
+                        if entity_match:
+                            entity = entity_match.group(1)
+                            processed_question = f"{entity}{processed_question}"
                         
             elif '在哪里' in question.lower() or '哪个地方' in question.lower():
                 # 如果问的是地点
-                import re
-                entity_match = re.search(r'(最早的\w+|\w+化石|\w+属)', last_answer)
-                if entity_match:
-                    entity = entity_match.group(1)
-                    processed_question = f"{entity}{processed_question}"
+                main_entity = extract_main_entity_from_answer(last_answer)
+
+                if main_entity:
+                    processed_question = f"{main_entity}{processed_question}"
+                else:
+                    # 如果没找到主要实体，尝试通用匹配
+                    import re
+                    entity_match = re.search(r'(最早的\w+|\w+化石|\w+属)', last_answer)
+                    if entity_match:
+                        entity = entity_match.group(1)
+                        processed_question = f"{entity}{processed_question}"
         
         # 如果问题包含"这个"或"这些"
         if '这个' in question or '这些' in question:
@@ -300,7 +474,7 @@ def generate_contextual_query(processed_question: str, conversation_history: lis
     return f"SELECT * FROM {session_info['table_name']} LIMIT 10"
 
 # 智能分析查询结果
-def analyze_with_llm(question: str, sql_query: str, result: list, llm, session_info: dict = None, conversation_history: list = None) -> str:
+def analyze_with_llm(question: str, sql_query: str, result: list, llm, session_info: dict = None, conversation_history: list = None, show_sql: bool = True) -> str:
     """使用LLM分析SQL查询结果，提供智能解释"""
     if not result:
         return "我不知道"
@@ -325,7 +499,9 @@ def analyze_with_llm(question: str, sql_query: str, result: list, llm, session_i
             context_info += "\n请根据对话历史理解当前问题中的代词和上下文引用。\n"
 
         # 准备分析提示
-        context = f"""
+        if show_sql:
+            # 显示SQL时，提供详细的分析过程格式
+            context = f"""
 用户问题：{question}
 
 执行的SQL查询：
@@ -334,16 +510,53 @@ def analyze_with_llm(question: str, sql_query: str, result: list, llm, session_i
 查询结果：
 {result}{context_info}
 
-请分析查询结果并回答用户的问题。要求：
+请详细分析查询结果并回答用户的问题。要求：
+
+**回答格式要求：**
+1. 首先给出直接答案
+2. 然后详细说明分析过程和如何获得这个结果
+3. 如果使用了数据计算，请说明计算步骤
+4. 如果涉及数据筛选或排序，请说明筛选/排序的依据
+
+**具体要求：**
 1. 直接回答用户的问题，不要重复查询结果的原始数据
 2. 如果用户使用了代词（如"他们"、"它"、"这个"等），请结合对话历史来理解指代内容
-3. 如果涉及时间/年代比较，请提供专业的时间顺序分析
-4. 如果涉及地质年代（如Silurian, Carboniferous等），请说明它们的时间关系
-5. 如果涉及地质演化程度，请考虑SiO2、MgO、K2O等化学成分的意义
-6. 如果是数值比较，请明确指出最大/最小值
-7. 如果是统计分析，请提供清晰的总结
-8. 请用中文回答，语言简洁专业
-9. 如果无法得出明确结论，请直接回答"我不知道"
+3. 如果涉及时间/年代比较，请详细说明时间顺序和依据
+4. 如果涉及地质年代（如Silurian, Carboniferous等），请说明它们的时间关系和地质意义
+5. 如果涉及地质演化程度，请考虑SiO2、MgO、K2O等化学成分的意义并详细解释
+6. 如果是数值比较，请明确指出比较的对象、标准和结果
+7. 如果是统计分析，请详细说明统计方法、样本范围和结论
+8. 如果涉及数据查找，请说明查找的条件和匹配结果
+9. 请用中文回答，语言清晰易懂但保持专业性
+10. 如果无法得出明确结论，请详细说明原因并建议改进方案
+
+**回答示例结构：**
+**答案：** [直接回答]
+**分析过程：** [详细说明如何得到这个结果，包括数据处理步骤]
+**数据依据：** [说明使用了哪些数据字段和条件]
+**计算方法：** [如果涉及计算，说明具体的计算过程]
+"""
+        else:
+            # 不显示SQL时，直接给出专业详细的回答
+            context = f"""
+用户问题：{question}
+
+基于数据分析结果：
+{result}{context_info}
+
+请直接给出详细且专业的回答。要求：
+
+1. 直接回答用户的问题，给出完整详细的结果
+2. 如果用户使用了代词（如"他们"、"它"、"这个"等），请结合对话历史来理解指代内容
+3. 如果涉及时间/年代，请提供具体的时间信息和相关背景
+4. 如果涉及地质年代（如Silurian, Carboniferous等），请详细解释其地质意义和时间关系
+5. 如果涉及地质演化，请考虑SiO2、MgO、K2O等化学成分的专业意义
+6. 如果是数值结果，请提供准确的数字和相关解释
+7. 如果是概念解释，请提供权威且详细的专业解释
+8. 请用中文回答，语言专业准确，内容详细完整
+9. 如果无法得出明确结论，请说明原因并提供专业建议
+
+请直接给出最终的专业答案，不需要展示分析过程。
 """
 
         # 调用LLM分析
@@ -491,28 +704,36 @@ def format_answer(question: str, sql_query: str, result: list, table_name: str) 
         formatted_result += f"... 还有{len(result) - 5}条记录"
         return formatted_result
 
-def create_full_response(question: str, sql_query: str, result: list, session_info: dict, conversation_history: list) -> str:
+def create_full_response(question: str, sql_query: str, result: list, session_info: dict, conversation_history: list, show_sql: bool = True) -> str:
     """创建包含SQL查询和答案的完整响应"""
     # 清理SQL查询，去除多余的空格和换行
     clean_sql = ' '.join(sql_query.split())
-    
-    print(f"[DEBUG] 正在创建包含SQL的响应: {clean_sql[:50]}...")  # 调试信息
-    
+
+    print(f"[DEBUG] 正在创建响应: {clean_sql[:50]}...")  # 调试信息
+
     # 创建LLM实例进行智能分析
     llm = create_llm()
-    
+
     if llm:
         # 尝试LLM智能分析
-        llm_analysis = analyze_with_llm(question, sql_query, result, llm, session_info, conversation_history)
+        llm_analysis = analyze_with_llm(question, sql_query, result, llm, session_info, conversation_history, show_sql)
         if llm_analysis and llm_analysis != "我不知道":
-            final_response = f"🔍 **SQL查询**: ```sql\n{clean_sql}\n```\n\n{llm_analysis}"
-            print(f"[DEBUG] LLM分析成功，返回包含SQL的响应")  # 调试信息
+            if show_sql:
+                final_response = f"🔍 **SQL查询**: ```sql\n{clean_sql}\n```\n\n{llm_analysis}"
+                print(f"[DEBUG] LLM分析成功，返回包含SQL的响应")  # 调试信息
+            else:
+                final_response = llm_analysis
+                print(f"[DEBUG] LLM分析成功，返回不含SQL的响应")  # 调试信息
             return final_response
-    
+
     # 如果LLM分析失败，使用基础格式化
     basic_answer = format_answer(question, sql_query, result, session_info['table_name'])
-    final_response = f"🔍 **SQL查询**: ```sql\n{clean_sql}\n```\n\n{basic_answer}"
-    print(f"[DEBUG] 使用基础格式化，返回包含SQL的响应")  # 调试信息
+    if show_sql:
+        final_response = f"🔍 **SQL查询**: ```sql\n{clean_sql}\n```\n\n{basic_answer}"
+        print(f"[DEBUG] 使用基础格式化，返回包含SQL的响应")  # 调试信息
+    else:
+        final_response = basic_answer
+        print(f"[DEBUG] 使用基础格式化，返回不含SQL的响应")  # 调试信息
     return final_response
 
 # 本地执行 SQL（不依赖 LangChain）
@@ -740,10 +961,14 @@ async def query_data(request: QueryRequest):
                 else:
                     sql_query = f"SELECT * FROM {session_info['table_name']} LIMIT 20"
         
+        # 判断问题是否适合显示SQL
+        sql_suitable = is_sql_suitable_question(request.question, session_info)
+
         # 执行查询
         try:
             result = execute_sql(session_info['db_path'], sql_query)
-            show_sql = True  # 默认显示SQL
+            # 只有在问题适合SQL且执行成功时才显示SQL
+            show_sql = sql_suitable
         except Exception as sql_error:
             print(f"SQL执行失败: {sql_error}")
             # 如果SQL执行失败，尝试不使用SQL的回答方式
@@ -763,7 +988,22 @@ async def query_data(request: QueryRequest):
 数据列：{', '.join(session_info['columns'])}
 数据行数：{session_info['row_count']}
 
-请基于用户问题和数据结构，提供专业的分析建议或解释为什么无法回答此问题。
+请基于用户问题和数据结构，提供详细的分析和建议。要求：
+
+**回答格式：**
+1. 首先说明问题分析结果
+2. 详细解释为什么这个问题需要特殊处理或无法通过简单查询解决
+3. 如果可能，提供解决方案或建议的分析方法
+4. 说明需要哪些额外信息或步骤才能回答这个问题
+
+**具体要求：**
+- 如果是概念性问题，请提供详细的定义和解释
+- 如果是分析类问题，请说明需要的分析方法和步骤
+- 如果是无法回答的问题，请详细说明原因和建议
+- 如果涉及专业领域，请提供相关背景知识
+- 语言要详细且易于理解，保持专业性
+
+请用中文详细回答。
 """
                     
                     from langchain_core.messages import HumanMessage
@@ -815,7 +1055,7 @@ async def query_data(request: QueryRequest):
             "answer": full_answer,
             "success": True,
             "conversation_id": conversation_id,
-            "note": "SQL查询已显示"
+            "note": "SQL查询已显示" if show_sql else "已分析问题（无SQL）"
         }
         
     except Exception as e:
